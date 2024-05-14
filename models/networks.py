@@ -506,9 +506,10 @@ class ResnetGenerator(nn.Module):
         ngf=64,
         norm_layer=nn.BatchNorm2d,
         use_dropout=False,
-        n_blocks=6,
+        n_blocks=4,
         padding_type="reflect",
         transfer=False,
+        n_blocks_transfer_net=4,
     ):
         """Construct a Resnet-based generator
 
@@ -525,6 +526,7 @@ class ResnetGenerator(nn.Module):
         super(ResnetGenerator, self).__init__()
         Conv2d = nn.Conv2d
         if type(norm_layer) == functools.partial:
+            print("Using partial", norm_layer.func)
             use_bias = norm_layer.func == nn.InstanceNorm2d
             if (
                 norm_layer.func != nn.InstanceNorm2d
@@ -539,7 +541,14 @@ class ResnetGenerator(nn.Module):
         n_blocks_enc = math.ceil(n_blocks / 2)
         n_blocks_dec = n_blocks - n_blocks_enc
         n_blocks_rec = n_blocks_dec
+        print("Encoder blocks: ", n_blocks_enc)
+        print("Decoder blocks: ", n_blocks_dec)
 
+        ## Encoder Architecture
+        """
+        Add initial Conv layer with 64 out channels
+        Similar to original AU-GAN
+        """
         model_enc = [
             nn.ReflectionPad2d(3),
             Conv2d(input_nc, ngf, kernel_size=7, padding=0, bias=use_bias),
@@ -547,7 +556,7 @@ class ResnetGenerator(nn.Module):
             nn.ReLU(True),
         ]
 
-        # Downsample two times. In h=the final COnv layer, we have 256 out channels
+        # Downsample two times. In h=the final Conv layer, we have 256 out channels
         n_downsampling = 2
         for i in range(n_downsampling):  # add downsampling layers
             mult = 2**i
@@ -563,9 +572,11 @@ class ResnetGenerator(nn.Module):
                 norm_layer(ngf * mult * 2),
                 nn.ReLU(True),
             ]
+        # We have The initial 3 layers of Original AUGAN. No difference if we use InstanceNorm or BatchNorm
 
+        # Add ResNet blocks
         mult = 2**n_downsampling
-        for i in range(n_blocks_enc):  # add ResNet blocks default 6 blocks
+        for i in range(n_blocks_enc):  # add ResNet blocks default 4 blocks (4 Blocks used in AU-GAN)
             model_enc += [
                 ResnetBlock(
                     ngf * mult,
@@ -578,24 +589,21 @@ class ResnetGenerator(nn.Module):
             ]
         mult_ = mult
 
+        ## Add the T-net to the Decoder.
+        ## This is an AU-GAN contribution on top of Fork GAN
+        ## Using 4 ResNet blocks as in the original AU-GAN
         if transfer:
-            n_blocks_transfer_net = 4
             for i in range(n_blocks_transfer_net):
                 model_enc += [ResnetBlock(ngf * mult, padding_type=padding_type, norm_layer=norm_layer, use_dropout=use_dropout, use_bias=use_bias, dilation=2)]
 
+        # Decoder Architecture
         model_dec = []
-        for i in range(n_blocks_dec):
-            model_dec += [
-                ResnetBlock(
-                    ngf * mult,
-                    padding_type=padding_type,
-                    norm_layer=norm_layer,
-                    use_dropout=use_dropout,
-                    use_bias=use_bias,
-                    dilation=2,
-                )
-            ]
 
+        ## Add ResNet blocks (Default 4 in AU-GAN)
+        for i in range(n_blocks_dec):
+            model_dec += [ResnetBlock(ngf * mult, padding_type=padding_type, norm_layer=norm_layer, use_dropout=use_dropout, use_bias=use_bias, dilation=2)]
+
+        ## Two downsampling layers with Relu
         for i in range(n_downsampling):  # add upsampling layers
             mult = 2 ** (n_downsampling - i)
             model_dec += [nn.Upsample(scale_factor=2, mode='bilinear'),
@@ -604,13 +612,12 @@ class ResnetGenerator(nn.Module):
                           norm_layer(int(ngf * mult / 2)),
                           nn.ReLU(True)]
 
-        # Divide decoder into two -> One for upsampling + output
-        model_dec_upsample = []
-        model_dec_upsample += [nn.ReflectionPad2d(3)]
-        model_dec_upsample += [nn.Conv2d(ngf, output_nc, kernel_size=7, padding=0)]
-        model_dec_upsample += [nn.Tanh()]
+        # Final Conv layer with 3 out channels and tanh activation
+        model_dec += [nn.ReflectionPad2d(3)]
+        model_dec += [nn.Conv2d(ngf, output_nc, kernel_size=7, padding=0)]
+        model_dec += [nn.Tanh()]
 
-        # Divide decoder into two -> One for Confidenc
+        # Divide decoder into two -> One for Confidence -> Need to implement later
         if transfer: # Create confidence prediction module if enabled
             model_conf = [
                 nn.ReflectionPad2d(3),
@@ -620,7 +627,9 @@ class ResnetGenerator(nn.Module):
                 nn.Softplus()
             ]
 
-        model_rec = []
+
+        # Reconstructor
+        self.model_rec = []
         model_rec += [GaussianNoise(std=0.02)]
         for i in range(n_blocks_rec):
             model_rec += [
@@ -658,23 +667,27 @@ class ResnetGenerator(nn.Module):
         model_rec += [nn.Tanh()]
 
         self.model_enc  = nn.Sequential(*model_enc)
-        self.model_dec  = nn.Sequential(*model_dec)
-        self.model_dec_upsample  = nn.Sequential(*model_dec_upsample)
-        self.model_rec  = nn.Sequential(*model_rec)
+        self.model_dec = nn.Sequential(*model_dec)
+        self.model_rec = nn.Sequential(*model_rec)
         if transfer:
             self.model_conf = nn.Sequential(*model_conf)
 
+    # def forward(self, input):
+    #     enc = self.model_enc(input)
+    #     dec = self.model_dec(enc)
+    #     rec = self.model_rec(enc)
+    #     dec_upsampled = self.model_dec_upsample(dec)
+    #     conf = None
+    #     if hasattr(self, 'model_conf'):
+    #         conf = self.model_conf(dec)
+    #         conf = F.interpolate(conf, size=input.shape[2:], mode='bilinear', align_corners=False) # Adjust as needed
+    #     return enc, rec, dec_upsampled, conf
+
     def forward(self, input):
         enc = self.model_enc(input)
-        dec = self.model_dec(enc)
-        rec = self.model_rec(enc)
-        dec_upsampled = self.model_dec_upsample(dec)
-        conf = None
-        if hasattr(self, 'model_conf'):
-            conf = self.model_conf(dec)
-            conf = F.interpolate(conf, size=input.shape[2:], mode='bilinear', align_corners=False) # Adjust as needed
-        return enc, rec, dec_upsampled, conf
-
+        rec = self.model_dec(enc)
+        dec = self.model_rec(enc)
+        return enc, rec, dec
 
 class ResnetBlock(nn.Module):
     """Define a Resnet block"""
@@ -950,160 +963,3 @@ class PixelDiscriminator(nn.Module):
         """Standard forward."""
         return self.net(input)
 
-
-##############################################################################
-# Unet Generator (Not adopted to ForkGAN for now)
-##############################################################################
-
-
-class UnetGenerator(nn.Module):
-    """Create a Unet-based generator"""
-
-    def __init__(
-        self,
-        input_nc,
-        output_nc,
-        num_downs,
-        ngf=64,
-        norm_layer=nn.BatchNorm2d,
-        use_dropout=False,
-        transfer=False,
-    ):
-        """Construct a Unet generator
-        Parameters:
-            input_nc (int)  -- the number of channels in input images
-            output_nc (int) -- the number of channels in output images
-            num_downs (int) -- the number of downsamplings in UNet. For example, # if |num_downs| == 7,
-                                image of size 128x128 will become of size 1x1 # at the bottleneck
-            ngf (int)       -- the number of filters in the last conv layer
-            norm_layer      -- normalization layer
-
-        We construct the U-Net from the innermost layer to the outermost layer.
-        It is a recursive process.
-        """
-        super(UnetGenerator, self).__init__()
-        # construct unet structure
-        unet_block = UnetSkipConnectionBlock(
-            ngf * 8,
-            ngf * 8,
-            input_nc=None,
-            submodule=None,
-            norm_layer=norm_layer,
-            innermost=True,
-        )  # add the innermost layer
-        for i in range(num_downs - 5):  # add intermediate layers with ngf * 8 filters
-            unet_block = UnetSkipConnectionBlock(
-                ngf * 8,
-                ngf * 8,
-                input_nc=None,
-                submodule=unet_block,
-                norm_layer=norm_layer,
-                use_dropout=use_dropout,
-            )
-        # gradually reduce the number of filters from ngf * 8 to ngf
-        unet_block = UnetSkipConnectionBlock(
-            ngf * 4, ngf * 8, input_nc=None, submodule=unet_block, norm_layer=norm_layer
-        )
-        unet_block = UnetSkipConnectionBlock(
-            ngf * 2, ngf * 4, input_nc=None, submodule=unet_block, norm_layer=norm_layer
-        )
-        unet_block = UnetSkipConnectionBlock(
-            ngf, ngf * 2, input_nc=None, submodule=unet_block, norm_layer=norm_layer
-        )
-        self.model = UnetSkipConnectionBlock(
-            output_nc,
-            ngf,
-            input_nc=input_nc,
-            submodule=unet_block,
-            outermost=True,
-            norm_layer=norm_layer,
-        )  # add the outermost layer
-
-    def forward(self, input):
-        """Standard forward"""
-        return self.model(input)
-
-
-class UnetSkipConnectionBlock(nn.Module):
-    """Defines the Unet submodule with skip connection.
-    X -------------------identity----------------------
-    |-- downsampling -- |submodule| -- upsampling --|
-    """
-
-    def __init__(
-        self,
-        outer_nc,
-        inner_nc,
-        input_nc=None,
-        submodule=None,
-        outermost=False,
-        innermost=False,
-        norm_layer=nn.BatchNorm2d,
-        use_dropout=False,
-    ):
-        """Construct a Unet submodule with skip connections.
-
-        Parameters:
-            outer_nc (int) -- the number of filters in the outer conv layer
-            inner_nc (int) -- the number of filters in the inner conv layer
-            input_nc (int) -- the number of channels in input images/features
-            submodule (UnetSkipConnectionBlock) -- previously defined submodules
-            outermost (bool)    -- if this module is the outermost module
-            innermost (bool)    -- if this module is the innermost module
-            norm_layer          -- normalization layer
-            use_dropout (bool)  -- if use dropout layers.
-        """
-        super(UnetSkipConnectionBlock, self).__init__()
-        self.outermost = outermost
-        if type(norm_layer) == functools.partial:
-            use_bias = norm_layer.func == nn.InstanceNorm2d
-        else:
-            use_bias = norm_layer == nn.InstanceNorm2d
-        if input_nc is None:
-            input_nc = outer_nc
-        downconv = nn.Conv2d(
-            input_nc, inner_nc, kernel_size=4, stride=2, padding=1, bias=use_bias
-        )
-        downrelu = nn.LeakyReLU(0.2, True)
-        downnorm = norm_layer(inner_nc)
-        uprelu = nn.ReLU(True)
-        upnorm = norm_layer(outer_nc)
-
-        if outermost:
-            upconv = nn.ConvTranspose2d(
-                inner_nc * 2, outer_nc, kernel_size=4, stride=2, padding=1
-            )
-            down = [downconv]
-            up = [uprelu, upconv, nn.Tanh()]
-            model = down + [submodule] + up
-        elif innermost:
-            upconv = nn.ConvTranspose2d(
-                inner_nc, outer_nc, kernel_size=4, stride=2, padding=1, bias=use_bias
-            )
-            down = [downrelu, downconv]
-            up = [uprelu, upconv, upnorm]
-            model = down + up
-        else:
-            upconv = nn.ConvTranspose2d(
-                inner_nc * 2,
-                outer_nc,
-                kernel_size=4,
-                stride=2,
-                padding=1,
-                bias=use_bias,
-            )
-            down = [downrelu, downconv, downnorm]
-            up = [uprelu, upconv, upnorm]
-
-            if use_dropout:
-                model = down + [submodule] + up + [nn.Dropout(0.5)]
-            else:
-                model = down + [submodule] + up
-
-        self.model = nn.Sequential(*model)
-
-    def forward(self, x):
-        if self.outermost:
-            return self.model(x)
-        else:  # add skip connections
-            return torch.cat([x, self.model(x)], 1)
